@@ -33,6 +33,8 @@ Use `STABLE_AUDIO_DEVICE=cuda` on a CUDA machine, or leave it unset to let `stab
 
 Choose a model per request with the `model` property. Valid values are `small-sfx`, `small-music`, and `medium`.
 
+For local development, the synchronous endpoint returns WAV bytes directly:
+
 ```bash
 curl -X POST http://localhost:8000/v1/audio/generations \
   -H "Content-Type: application/json" \
@@ -49,9 +51,46 @@ curl -X POST http://localhost:8000/v1/audio/generations \
 
 The API also accepts full Hugging Face repo IDs as aliases, for example `"model": "stabilityai/stable-audio-3-medium"`.
 
+## Generate With Jobs
+
+For cloud deployments, use the async job endpoints. They return quickly, generate audio in the background, write the WAV to local storage or S3/R2, and expose a download URL when complete.
+
+```bash
+curl -X POST http://localhost:8000/jobs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "small-sfx",
+    "prompt": "short metallic impact with room reverb",
+    "duration": 5,
+    "steps": 8
+  }'
+```
+
+Response:
+
+```json
+{
+  "id": "68e48e7af36c4d829e3797a0b3e7687c",
+  "status": "queued",
+  "status_url": "http://localhost:8000/jobs/68e48e7af36c4d829e3797a0b3e7687c"
+}
+```
+
+Poll status:
+
+```bash
+curl http://localhost:8000/jobs/68e48e7af36c4d829e3797a0b3e7687c
+```
+
+When `status` is `succeeded`, `download_url` points to the generated WAV. Without object storage configured, job outputs are written under `outputs/` and served by the local API.
+
+Job state is kept in memory. For multiple workers, restarts, or production serverless, use Redis/Postgres or another shared job store.
+
 ## Endpoints
 
 - `GET /health` returns available models, preloaded models, loaded models, and duration limits.
+- `POST /jobs` starts a background generation job and returns a job ID.
+- `GET /jobs/{id}` returns job status and a download URL when complete.
 - `POST /v1/audio/generations` returns a `audio/wav` response.
 - `POST /generate` is an alias for the generation endpoint.
 
@@ -67,5 +106,12 @@ The API also accepts full Hugging Face repo IDs as aliases, for example `"model"
 | `STABLE_AUDIO_MODEL_HALF` | `true` | Use fp16 on CUDA. Automatically disabled by the model on CPU/MPS. |
 | `STABLE_AUDIO_MAX_DURATION` | `380` | API-wide duration cap. Small models still cap at 120s; medium caps at 380s. |
 | `STABLE_AUDIO_MAX_STEPS` | `50` | API sampling step limit. |
+| `STABLE_AUDIO_OUTPUT_DIR` | `outputs` | Local output directory for job WAVs when S3/R2 is not configured. |
+| `STABLE_AUDIO_STORAGE_BUCKET` | unset | S3/R2 bucket for job WAV output. Enables S3-compatible storage. |
+| `STABLE_AUDIO_STORAGE_PREFIX` | `stable-audio/jobs` | Object key prefix for uploaded WAV files. |
+| `STABLE_AUDIO_STORAGE_ENDPOINT_URL` | unset | S3-compatible endpoint URL, such as Cloudflare R2. |
+| `STABLE_AUDIO_STORAGE_REGION` | `us-east-1` | S3 region. Use `auto` for Cloudflare R2 if desired. |
+| `STABLE_AUDIO_STORAGE_PUBLIC_BASE_URL` | unset | Optional public/CDN base URL. If unset, the API generates presigned URLs. |
+| `STABLE_AUDIO_PRESIGNED_URL_EXPIRES` | `3600` | Presigned download URL lifetime in seconds. |
 
 The upstream Stable Audio 3 package pins PyTorch and torchaudio. This project mirrors its CUDA 12.6 `uv` source configuration for Linux x86_64; macOS uses the standard PyPI wheels.

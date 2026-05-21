@@ -17,6 +17,7 @@ __pycache__/
 *.zip
 *.tar
 *.tar.gz
+outputs/
 
 Dockerfile.*
 docker-compose*.yml

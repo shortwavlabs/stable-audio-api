@@ -6,13 +6,16 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import anyio
 import soundfile as sf
 from dotenv import find_dotenv, load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -102,6 +105,27 @@ MAX_DURATION_SECONDS = _env_float(
     max(MODEL_DURATION_LIMITS_SECONDS.values()),
 )
 MAX_STEPS = _env_int("STABLE_AUDIO_MAX_STEPS", 50)
+OUTPUT_DIR = Path(os.getenv("STABLE_AUDIO_OUTPUT_DIR", "outputs"))
+STORAGE_BUCKET = (
+    os.getenv("STABLE_AUDIO_STORAGE_BUCKET")
+    or os.getenv("AWS_S3_BUCKET")
+    or os.getenv("R2_BUCKET")
+    or os.getenv("R2_BUCKET_NAME")
+)
+STORAGE_PREFIX = os.getenv("STABLE_AUDIO_STORAGE_PREFIX", "stable-audio/jobs").strip("/")
+STORAGE_ENDPOINT_URL = (
+    os.getenv("STABLE_AUDIO_STORAGE_ENDPOINT_URL")
+    or os.getenv("AWS_ENDPOINT_URL_S3")
+    or os.getenv("R2_ENDPOINT_URL")
+)
+STORAGE_REGION = (
+    os.getenv("STABLE_AUDIO_STORAGE_REGION")
+    or os.getenv("AWS_REGION")
+    or os.getenv("AWS_DEFAULT_REGION")
+    or "us-east-1"
+)
+STORAGE_PUBLIC_BASE_URL = os.getenv("STABLE_AUDIO_STORAGE_PUBLIC_BASE_URL")
+PRESIGNED_URL_EXPIRES = _env_int("STABLE_AUDIO_PRESIGNED_URL_EXPIRES", 3600)
 
 Duration = Annotated[
     float,
@@ -162,6 +186,7 @@ class HealthResponse(BaseModel):
     model: str
     device: str | None
     loaded: bool
+    storage_backend: str
     available_models: list[str]
     loaded_models: list[str]
     preload_models: list[str]
@@ -170,11 +195,183 @@ class HealthResponse(BaseModel):
     max_steps: int
 
 
+JobStatus = Literal["queued", "running", "succeeded", "failed"]
+StorageBackend = Literal["local", "s3"]
+
+
+class CreateJobResponse(BaseModel):
+    id: str
+    status: JobStatus
+    status_url: str
+
+
+class JobResponse(BaseModel):
+    id: str
+    status: JobStatus
+    model: str
+    duration: float
+    steps: int
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    download_url: str | None = None
+    error: str | None = None
+    storage_backend: StorageBackend | None = None
+    storage_key: str | None = None
+    sample_rate: int | None = None
+
+
 @dataclass(frozen=True)
 class GenerationResult:
     audio: object
     model_name: SupportedModel
     sample_rate: int
+
+
+@dataclass(frozen=True)
+class StoredAudio:
+    backend: StorageBackend
+    key: str
+    local_path: Path | None = None
+
+
+@dataclass
+class JobRecord:
+    id: str
+    request: GenerateAudioRequest
+    status: JobStatus
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    stored_audio: StoredAudio | None = None
+    sample_rate: int | None = None
+    error: str | None = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class AudioStorage:
+    def __init__(self) -> None:
+        self.backend: StorageBackend = "s3" if STORAGE_BUCKET else "local"
+        self._s3_client = None
+
+    def save_wav(self, job_id: str, model_name: str, wav_bytes: bytes) -> StoredAudio:
+        if self.backend == "s3":
+            return self._save_s3(job_id, model_name, wav_bytes)
+        return self._save_local(job_id, model_name, wav_bytes)
+
+    def download_url(self, stored_audio: StoredAudio, request: Request) -> str:
+        if stored_audio.backend == "s3":
+            return self._s3_download_url(stored_audio.key)
+        return str(request.url_for("download_job_audio", job_id=stored_audio.key))
+
+    def _save_local(self, job_id: str, model_name: str, wav_bytes: bytes) -> StoredAudio:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        path = OUTPUT_DIR / f"{job_id}-{model_name}.wav"
+        path.write_bytes(wav_bytes)
+        return StoredAudio(backend="local", key=job_id, local_path=path)
+
+    def _save_s3(self, job_id: str, model_name: str, wav_bytes: bytes) -> StoredAudio:
+        if STORAGE_BUCKET is None:
+            raise RuntimeError("STABLE_AUDIO_STORAGE_BUCKET is required for S3 storage.")
+
+        key_parts = [part for part in (STORAGE_PREFIX, f"{job_id}-{model_name}.wav") if part]
+        key = "/".join(key_parts)
+        self._s3().put_object(
+            Bucket=STORAGE_BUCKET,
+            Key=key,
+            Body=wav_bytes,
+            ContentType="audio/wav",
+        )
+        return StoredAudio(backend="s3", key=key)
+
+    def _s3_download_url(self, key: str) -> str:
+        if STORAGE_PUBLIC_BASE_URL:
+            return f"{STORAGE_PUBLIC_BASE_URL.rstrip('/')}/{key}"
+
+        if STORAGE_BUCKET is None:
+            raise RuntimeError("STABLE_AUDIO_STORAGE_BUCKET is required for S3 storage.")
+
+        return self._s3().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": STORAGE_BUCKET, "Key": key},
+            ExpiresIn=PRESIGNED_URL_EXPIRES,
+        )
+
+    def _s3(self):
+        if self._s3_client is not None:
+            return self._s3_client
+
+        import boto3
+        from botocore.config import Config
+
+        access_key = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID")
+        secret_key = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY")
+
+        kwargs = {
+            "service_name": "s3",
+            "region_name": STORAGE_REGION,
+            "endpoint_url": STORAGE_ENDPOINT_URL,
+            "config": Config(signature_version="s3v4"),
+        }
+        if access_key and secret_key:
+            kwargs["aws_access_key_id"] = access_key
+            kwargs["aws_secret_access_key"] = secret_key
+
+        self._s3_client = boto3.client(**kwargs)
+        return self._s3_client
+
+
+class JobStore:
+    def __init__(self) -> None:
+        self._jobs: dict[str, JobRecord] = {}
+        self._lock = asyncio.Lock()
+
+    async def create(self, generation_request: GenerateAudioRequest) -> JobRecord:
+        job = JobRecord(
+            id=uuid4().hex,
+            request=generation_request,
+            status="queued",
+            created_at=_utc_now(),
+        )
+        async with self._lock:
+            self._jobs[job.id] = job
+        return job
+
+    async def get(self, job_id: str) -> JobRecord | None:
+        async with self._lock:
+            return self._jobs.get(job_id)
+
+    async def mark_running(self, job_id: str) -> JobRecord | None:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.status = "running"
+            job.started_at = _utc_now()
+            return job
+
+    async def mark_succeeded(
+        self,
+        job_id: str,
+        stored_audio: StoredAudio,
+        sample_rate: int,
+    ) -> None:
+        async with self._lock:
+            job = self._jobs[job_id]
+            job.status = "succeeded"
+            job.completed_at = _utc_now()
+            job.stored_audio = stored_audio
+            job.sample_rate = sample_rate
+
+    async def mark_failed(self, job_id: str, error: str) -> None:
+        async with self._lock:
+            job = self._jobs[job_id]
+            job.status = "failed"
+            job.completed_at = _utc_now()
+            job.error = error
 
 
 class ModelRuntime:
@@ -255,6 +452,8 @@ class ModelRuntime:
 
 
 runtime = ModelRuntime()
+jobs = JobStore()
+audio_storage = AudioStorage()
 
 
 @asynccontextmanager
@@ -292,6 +491,56 @@ def _audio_tensor_to_wav_bytes(audio, sample_rate: int) -> bytes:
     return buffer.getvalue()
 
 
+def _job_response(job: JobRecord, request: Request) -> JobResponse:
+    download_url = None
+    storage_backend = None
+    storage_key = None
+
+    if job.stored_audio is not None:
+        download_url = audio_storage.download_url(job.stored_audio, request)
+        storage_backend = job.stored_audio.backend
+        storage_key = job.stored_audio.key
+
+    return JobResponse(
+        id=job.id,
+        status=job.status,
+        model=job.request.model,
+        duration=job.request.duration,
+        steps=job.request.steps,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        download_url=download_url,
+        error=job.error,
+        storage_backend=storage_backend,
+        storage_key=storage_key,
+        sample_rate=job.sample_rate,
+    )
+
+
+async def _run_generation_job(job_id: str) -> None:
+    job = await jobs.mark_running(job_id)
+    if job is None:
+        logger.error("Cannot run missing job %s", job_id)
+        return
+
+    try:
+        async with runtime.lock:
+            result = await anyio.to_thread.run_sync(runtime.generate, job.request)
+            wav_bytes = _audio_tensor_to_wav_bytes(result.audio, result.sample_rate)
+
+        stored_audio = await anyio.to_thread.run_sync(
+            audio_storage.save_wav,
+            job.id,
+            result.model_name,
+            wav_bytes,
+        )
+        await jobs.mark_succeeded(job.id, stored_audio, result.sample_rate)
+    except Exception as exc:
+        logger.exception("Job %s failed.", job_id)
+        await jobs.mark_failed(job_id, str(exc))
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     effective_duration_limits = {
@@ -303,12 +552,55 @@ async def health() -> HealthResponse:
         model=DEFAULT_MODEL_NAME,
         device=MODEL_DEVICE,
         loaded=runtime.loaded,
+        storage_backend=audio_storage.backend,
         available_models=list(SUPPORTED_MODELS),
         loaded_models=runtime.loaded_models,
         preload_models=PRELOAD_MODEL_NAMES,
         model_duration_limits_seconds=effective_duration_limits,
         max_duration_seconds=MAX_DURATION_SECONDS,
         max_steps=MAX_STEPS,
+    )
+
+
+@app.post("/jobs", response_model=CreateJobResponse, status_code=status.HTTP_202_ACCEPTED)
+async def create_job(
+    generation_request: GenerateAudioRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+) -> CreateJobResponse:
+    job = await jobs.create(generation_request)
+    background_tasks.add_task(_run_generation_job, job.id)
+    return CreateJobResponse(
+        id=job.id,
+        status=job.status,
+        status_url=str(request.url_for("get_job", job_id=job.id)),
+    )
+
+
+@app.get("/jobs/{job_id}", response_model=JobResponse)
+async def get_job(job_id: str, request: Request) -> JobResponse:
+    job = await jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    return _job_response(job, request)
+
+
+@app.get("/jobs/{job_id}/audio", include_in_schema=False)
+async def download_job_audio(job_id: str) -> FileResponse:
+    job = await jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if job.status != "succeeded" or job.stored_audio is None:
+        raise HTTPException(status_code=409, detail=f"Job is {job.status}.")
+    if job.stored_audio.backend != "local" or job.stored_audio.local_path is None:
+        raise HTTPException(status_code=404, detail="Local audio file is not available.")
+    if not job.stored_audio.local_path.exists():
+        raise HTTPException(status_code=404, detail="Local audio file is missing.")
+
+    return FileResponse(
+        job.stored_audio.local_path,
+        media_type="audio/wav",
+        filename=job.stored_audio.local_path.name,
     )
 
 

@@ -11,11 +11,13 @@ Start with a long-running GPU instance:
 
 This is simpler than serverless for the first production pass because Stable Audio model startup can be slow, generation may run longer than HTTP proxy limits, and WAV responses can become large.
 
-After the API is stable, a serverless deployment can work better if the API is changed to a job-based flow:
+This API includes a job-based flow for cloud deployments:
 
 - `POST /jobs` starts generation and returns a job ID.
 - A background worker writes the WAV to S3, R2, or provider storage.
 - `GET /jobs/{id}` returns status and a download URL.
+
+The original synchronous endpoints are still available for local development.
 
 ## Hardware
 
@@ -46,6 +48,10 @@ STABLE_AUDIO_PRELOAD_MODELS=small-sfx
 STABLE_AUDIO_MAX_DURATION=380
 STABLE_AUDIO_MAX_STEPS=50
 HF_HOME=/workspace/.cache/huggingface
+STABLE_AUDIO_STORAGE_BUCKET=your-output-bucket
+STABLE_AUDIO_STORAGE_PREFIX=stable-audio/jobs
+STABLE_AUDIO_STORAGE_ENDPOINT_URL=https://account-id.r2.cloudflarestorage.com
+STABLE_AUDIO_STORAGE_REGION=auto
 ```
 
 Notes:
@@ -53,6 +59,8 @@ Notes:
 - `HF_TOKEN` must belong to an account that has accepted the gated model terms.
 - Preload only the models you actually need. Preloading all three models increases startup time and VRAM pressure.
 - `HF_HOME` should point to persistent storage so model files survive restarts.
+- Leave `STABLE_AUDIO_STORAGE_BUCKET` unset for local filesystem job output in `outputs/`.
+- For Cloudflare R2, set `STABLE_AUDIO_STORAGE_ENDPOINT_URL`, `STABLE_AUDIO_STORAGE_REGION=auto`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
 
 ## Storage and Model Cache
 
@@ -75,6 +83,13 @@ Disk guidance:
 - One small model cache needs several GB.
 - All three models plus dependencies can grow quickly.
 - Use at least 80 GB if you plan to test all models on the same machine.
+
+Job output storage:
+
+- Local fallback writes WAV files to `STABLE_AUDIO_OUTPUT_DIR`, default `outputs/`.
+- S3/R2 storage is enabled when `STABLE_AUDIO_STORAGE_BUCKET` is set.
+- If `STABLE_AUDIO_STORAGE_PUBLIC_BASE_URL` is set, `GET /jobs/{id}` returns public URLs from that base.
+- Otherwise, `GET /jobs/{id}` returns presigned S3-compatible URLs.
 
 ## Docker
 
@@ -178,7 +193,7 @@ RunPod Serverless has two relevant modes:
 - Queue-based endpoints: better for long-running jobs, but the app must be wrapped in a handler.
 - Load-balancing endpoints: can run FastAPI directly, but have request/processing/payload limits.
 
-For this API, load-balancing serverless is the closer fit because it supports custom FastAPI routes. However, RunPod documents these constraints:
+For this API, load-balancing serverless is the closer fit because it supports custom FastAPI routes. The job endpoints help avoid long client-held HTTP requests. However, RunPod documents these constraints:
 
 - Processing timeout around minutes, not unlimited.
 - Request/response payload limit around 30 MB.
@@ -186,11 +201,11 @@ For this API, load-balancing serverless is the closer fit because it supports cu
 
 If using RunPod Serverless:
 
-- Prefer a job-based API.
 - Store generated WAV files externally.
 - Return URLs instead of raw WAV bytes.
 - Consider active workers above zero if cold starts are unacceptable.
 - Use model caching when possible, but note that RunPod cached model support is currently one model per endpoint.
+- Replace the in-memory job store with Redis/Postgres if you run more than one worker.
 
 ## Vast.ai Instances
 
@@ -240,9 +255,8 @@ Start conservative:
 Good first cloud test:
 
 ```bash
-curl -X POST https://YOUR_ENDPOINT/v1/audio/generations \
+curl -X POST https://YOUR_ENDPOINT/jobs \
   -H "Content-Type: application/json" \
-  --output test.wav \
   -d '{
     "model": "small-sfx",
     "prompt": "short metallic impact with room reverb",
@@ -250,6 +264,8 @@ curl -X POST https://YOUR_ENDPOINT/v1/audio/generations \
     "steps": 8
   }'
 ```
+
+Then poll the returned `status_url` until `status` is `succeeded`, and download from `download_url`.
 
 Then test `small-music`, and only test `medium` after verifying Flash Attention works on the chosen GPU image.
 

@@ -5,6 +5,7 @@ description = "FastAPI server for Stability AI Stable Audio 3 Small SFX."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "boto3>=1.42.0",
     "fastapi[standard]>=0.128.0",
     "python-dotenv>=1.2.1",
     "soundfile>=0.13.1",
