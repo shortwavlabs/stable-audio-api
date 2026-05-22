@@ -13,8 +13,10 @@ This is simpler than serverless for the first production pass because Stable Aud
 
 This API includes a job-based flow for cloud deployments:
 
-- `POST /jobs` starts generation and returns a job ID.
-- A background worker writes the WAV to S3, R2, or provider storage.
+- `POST /jobs` starts text-to-audio generation and returns a job ID.
+- `POST /jobs/variations` starts audio-to-audio generation from uploaded source audio.
+- `POST /jobs/inpaint` starts inpainting or continuation from uploaded source audio.
+- A background worker writes the WAV or ZIP artifact to S3, R2, or provider storage.
 - `GET /jobs/{id}` returns status and a download URL.
 
 The original synchronous endpoints are still available for local development.
@@ -47,6 +49,8 @@ STABLE_AUDIO_DEFAULT_MODEL=small-sfx
 STABLE_AUDIO_PRELOAD_MODELS=small-sfx
 STABLE_AUDIO_MAX_DURATION=380
 STABLE_AUDIO_MAX_STEPS=50
+STABLE_AUDIO_MAX_BATCH_SIZE=4
+STABLE_AUDIO_MAX_UPLOAD_BYTES=104857600
 HF_HOME=/workspace/.cache/huggingface
 STABLE_AUDIO_STORAGE_BUCKET=your-output-bucket
 STABLE_AUDIO_STORAGE_PREFIX=stable-audio/jobs
@@ -86,7 +90,7 @@ Disk guidance:
 
 Job output storage:
 
-- Local fallback writes WAV files to `STABLE_AUDIO_OUTPUT_DIR`, default `outputs/`.
+- Local fallback writes WAV or ZIP artifacts to `STABLE_AUDIO_OUTPUT_DIR`, default `outputs/`.
 - S3/R2 storage is enabled when `STABLE_AUDIO_STORAGE_BUCKET` is set.
 - If `STABLE_AUDIO_STORAGE_PUBLIC_BASE_URL` is set, `GET /jobs/{id}` returns public URLs from that base.
 - Otherwise, `GET /jobs/{id}` returns presigned S3-compatible URLs.

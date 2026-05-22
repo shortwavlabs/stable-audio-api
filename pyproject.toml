@@ -1,7 +1,7 @@
 [project]
 name = "stable-audio-api"
 version = "0.1.0"
-description = "FastAPI server for Stability AI Stable Audio 3 Small SFX."
+description = "FastAPI server for Stability AI Stable Audio 3."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [

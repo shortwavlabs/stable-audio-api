@@ -39,16 +39,24 @@ The current JSON generation endpoints expose this request shape:
   "duration": 8,
   "steps": 8,
   "cfg_scale": 1.0,
+  "batch_size": 1,
   "seed": -1,
-  "chunked_decode": null
+  "chunked_decode": null,
+  "apg_scale": 1.0,
+  "duration_padding_sec": 6.0,
+  "sampler_kwargs": {}
 }
 ```
 
 Available endpoints:
 
-- `POST /v1/audio/generations` returns WAV bytes directly for local development.
+- `POST /v1/audio/generations` returns WAV bytes directly for local development, or a ZIP of WAVs when `batch_size > 1`.
+- `POST /v1/audio/variations` accepts multipart source audio for audio-to-audio editing.
+- `POST /v1/audio/inpaint` accepts multipart source audio for inpainting and continuation.
 - `POST /generate` is a local-development alias.
 - `POST /jobs` starts a background text-to-audio job.
+- `POST /jobs/variations` starts a background audio-to-audio job.
+- `POST /jobs/inpaint` starts a background inpainting or continuation job.
 - `GET /jobs/{id}` returns job status and a download URL.
 
 ## Current API Fields
@@ -61,8 +69,12 @@ Available endpoints:
 | `duration` | number | Output length in seconds. Small models cap at 120s; medium caps at 380s. |
 | `steps` | integer | Sampling steps. Upstream default is `8`; higher is not always better for post-trained models. |
 | `cfg_scale` | number | Guidance scale. Mostly useful for base checkpoints upstream. |
+| `batch_size` | integer | Number of variations to generate. Batch outputs are returned as ZIP files. |
 | `seed` | integer | `-1` chooses a random seed. Use a fixed integer for repeatable output. |
 | `chunked_decode` | boolean or null | Overrides chunked autoencoder decoding. `null` uses the model default. |
+| `apg_scale` | number | Adaptive Projected Guidance scale. |
+| `duration_padding_sec` | number | Extra seconds used by the upstream model when adapting variable-length generation. |
+| `sampler_kwargs` | object | Advanced scalar sampler keyword arguments. Explicit request fields cannot be overridden here. |
 
 ## Upstream Generation Options
 
@@ -201,17 +213,17 @@ audio = model.generate(
 
 The original 0s to 8s region is preserved, and the model generates the 8s to 16s continuation.
 
-## Recommended API Shape for Inpainting
+## Current API Shape for Inpainting
 
-The current API does not expose inpainting yet. Since inpainting requires input audio, the cleanest API shape is `multipart/form-data`.
+Inpainting is exposed as `multipart/form-data` because it requires input audio.
 
-Recommended local endpoint:
+Local endpoint:
 
 ```http
 POST /v1/audio/inpaint
 ```
 
-Recommended async job endpoint:
+Async job endpoint:
 
 ```http
 POST /jobs/inpaint
@@ -229,8 +241,12 @@ Suggested form fields:
 | `inpaint_start_seconds` | number or JSON list | Start time, or multiple start times. |
 | `inpaint_end_seconds` | number or JSON list | End time, or multiple end times. |
 | `steps` | integer | Sampling steps. Default `8`. |
+| `batch_size` | integer | Number of variations. Batch outputs are returned as ZIP files. |
 | `seed` | integer | `-1` random, fixed integer for repeatable output. |
 | `chunked_decode` | boolean or null | Optional decode override. |
+| `apg_scale` | number | Advanced APG scale. |
+| `duration_padding_sec` | number | Advanced duration padding control. |
+| `sampler_kwargs` | JSON object string | Advanced sampler kwargs, such as `{"sampler_type":"pingpong"}` if supported upstream. |
 
 Example multipart request:
 
@@ -259,18 +275,56 @@ curl -X POST http://localhost:8000/jobs/inpaint \
   -F audio=@loop.wav
 ```
 
-The async endpoint should follow the same storage pattern as `POST /jobs`: generate in the background, write the WAV to S3, R2, provider storage, or local output storage, then return the final `download_url` from `GET /jobs/{id}`.
+The async endpoint follows the same storage pattern as `POST /jobs`: generate in the background, write the WAV or ZIP artifact to S3, R2, provider storage, or local output storage, then return the final `download_url` from `GET /jobs/{id}`.
+
+## Current API Shape for Audio-to-Audio
+
+Audio-to-audio is exposed as `multipart/form-data` through:
+
+```http
+POST /v1/audio/variations
+POST /jobs/variations
+```
+
+Suggested form fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `audio` | file | Source WAV, FLAC, MP3, or other format supported by the audio loader. |
+| `model` | string | Usually `small-music` or `small-sfx`. |
+| `prompt` | string | Description of the desired variation. |
+| `duration` | number | Total target output duration. |
+| `init_noise_level` | number | `0.0` to `1.0`; lower preserves more source audio. |
+| `steps` | integer | Sampling steps. Default `8`. |
+| `batch_size` | integer | Number of variations. Batch outputs are returned as ZIP files. |
+| `seed` | integer | `-1` random, fixed integer for repeatable output. |
+| `chunked_decode` | boolean or null | Optional decode override. |
+| `apg_scale` | number | Advanced APG scale. |
+| `duration_padding_sec` | number | Advanced duration padding control. |
+| `sampler_kwargs` | JSON object string | Advanced sampler kwargs. |
+
+Example:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/variations \
+  -F model=small-music \
+  -F prompt="bossa nova bassline with warm upright bass" \
+  -F duration=8 \
+  -F init_noise_level=0.5 \
+  -F audio=@loop.wav \
+  --output variation.wav
+```
 
 ## Implementation Notes for This API
 
-To add inpainting support, extend the server with:
+The API now includes:
 
-- A multipart parser using FastAPI `UploadFile` and `Form`.
-- A helper that loads uploaded audio into `(sample_rate, waveform)`.
-- A request model or form parser for scalar and list-based mask times.
-- A synchronous local endpoint such as `POST /v1/audio/inpaint`.
-- An async production endpoint such as `POST /jobs/inpaint`.
-- Reuse of the existing model cache, WAV encoding, job store, and storage writer.
+- Multipart parsing using FastAPI `UploadFile` and `Form`.
+- Uploaded audio loading into `(sample_rate, waveform)`.
+- Scalar and list-based inpaint mask times.
+- Synchronous local endpoints for text generation, variation, and inpainting.
+- Async production job endpoints for text generation, variation, and inpainting.
+- Shared model cache, WAV/ZIP artifact encoding, job store, and storage writer.
 
 Validation should reject:
 
@@ -281,4 +335,3 @@ Validation should reject:
 - Mismatched start/end list lengths.
 - Negative mask times.
 - Audio inputs that cannot be decoded.
-

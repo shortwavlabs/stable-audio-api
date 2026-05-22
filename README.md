@@ -45,15 +45,67 @@ curl -X POST http://localhost:8000/v1/audio/generations \
     "duration": 7,
     "steps": 8,
     "cfg_scale": 1.0,
-    "seed": -1
+    "batch_size": 1,
+    "seed": -1,
+    "apg_scale": 1.0,
+    "duration_padding_sec": 6.0,
+    "sampler_kwargs": {}
   }'
 ```
 
 The API also accepts full Hugging Face repo IDs as aliases, for example `"model": "stabilityai/stable-audio-3-medium"`.
 
+When `batch_size` is greater than `1`, synchronous generation endpoints return `application/zip` containing one WAV per variation. A `batch_size` of `1` keeps returning a plain `audio/wav` response.
+
+## Audio-to-Audio Variations
+
+Use the multipart variation endpoint to edit or restyle an existing audio file. `init_noise_level` controls how strongly the source audio influences the output: lower values preserve more of the source, and `1.0` behaves like pure text-to-audio.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/variations \
+  -F audio=@loop.wav \
+  -F model=small-music \
+  -F prompt="bossa nova bassline with warm upright bass" \
+  -F duration=8 \
+  -F init_noise_level=0.5 \
+  --output variation.wav
+```
+
+The async version is `POST /jobs/variations`.
+
+## Inpainting and Continuation
+
+Use the multipart inpainting endpoint to regenerate a time range while preserving the rest of the uploaded audio.
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/inpaint \
+  -F audio=@loop.wav \
+  -F model=small-music \
+  -F prompt="punchy drum fill with tight snare rolls" \
+  -F duration=16 \
+  -F inpaint_start_seconds=4 \
+  -F inpaint_end_seconds=8 \
+  --output inpainted-loop.wav
+```
+
+Multiple regions can be passed as JSON lists:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/inpaint \
+  -F audio=@loop.wav \
+  -F model=small-music \
+  -F prompt="cleaner percussion variation" \
+  -F duration=16 \
+  -F 'inpaint_start_seconds=[2,12]' \
+  -F 'inpaint_end_seconds=[4,14]' \
+  --output inpainted-loop.wav
+```
+
+For continuation, set `duration` longer than the source clip and start the inpaint region at the end of the source. The async version is `POST /jobs/inpaint`.
+
 ## Generate With Jobs
 
-For cloud deployments, use the async job endpoints. They return quickly, generate audio in the background, write the WAV to local storage or S3/R2, and expose a download URL when complete.
+For cloud deployments, use the async job endpoints. They return quickly, generate audio in the background, write the artifact to local storage or S3/R2, and expose a download URL when complete.
 
 ```bash
 curl -X POST http://localhost:8000/jobs \
@@ -82,7 +134,7 @@ Poll status:
 curl http://localhost:8000/jobs/68e48e7af36c4d829e3797a0b3e7687c
 ```
 
-When `status` is `succeeded`, `download_url` points to the generated WAV. Without object storage configured, job outputs are written under `outputs/` and served by the local API.
+When `status` is `succeeded`, `download_url` points to the generated WAV or ZIP. Without object storage configured, job outputs are written under `outputs/` and served by the local API.
 
 Job state is kept in memory. For multiple workers, restarts, or production serverless, use Redis/Postgres or another shared job store.
 
@@ -90,8 +142,12 @@ Job state is kept in memory. For multiple workers, restarts, or production serve
 
 - `GET /health` returns available models, preloaded models, loaded models, and duration limits.
 - `POST /jobs` starts a background generation job and returns a job ID.
+- `POST /jobs/variations` starts a background audio-to-audio variation job.
+- `POST /jobs/inpaint` starts a background inpainting or continuation job.
 - `GET /jobs/{id}` returns job status and a download URL when complete.
-- `POST /v1/audio/generations` returns a `audio/wav` response.
+- `POST /v1/audio/generations` returns `audio/wav`, or `application/zip` when `batch_size > 1`.
+- `POST /v1/audio/variations` accepts multipart audio input and returns generated audio.
+- `POST /v1/audio/inpaint` accepts multipart audio input and returns inpainted audio.
 - `POST /generate` is an alias for the generation endpoint.
 
 ## Configuration
@@ -106,8 +162,10 @@ Job state is kept in memory. For multiple workers, restarts, or production serve
 | `STABLE_AUDIO_MODEL_HALF` | `true` | Use fp16 on CUDA. Automatically disabled by the model on CPU/MPS. |
 | `STABLE_AUDIO_MAX_DURATION` | `380` | API-wide duration cap. Small models still cap at 120s; medium caps at 380s. |
 | `STABLE_AUDIO_MAX_STEPS` | `50` | API sampling step limit. |
-| `STABLE_AUDIO_OUTPUT_DIR` | `outputs` | Local output directory for job WAVs when S3/R2 is not configured. |
-| `STABLE_AUDIO_STORAGE_BUCKET` | unset | S3/R2 bucket for job WAV output. Enables S3-compatible storage. |
+| `STABLE_AUDIO_MAX_BATCH_SIZE` | `4` | Maximum number of variations per request. Batch outputs are returned as ZIP files. |
+| `STABLE_AUDIO_MAX_UPLOAD_BYTES` | `104857600` | Maximum uploaded source-audio size for variation and inpainting endpoints. |
+| `STABLE_AUDIO_OUTPUT_DIR` | `outputs` | Local output directory for job artifacts when S3/R2 is not configured. |
+| `STABLE_AUDIO_STORAGE_BUCKET` | unset | S3/R2 bucket for job artifacts. Enables S3-compatible storage. |
 | `STABLE_AUDIO_STORAGE_PREFIX` | `stable-audio/jobs` | Object key prefix for uploaded WAV files. |
 | `STABLE_AUDIO_STORAGE_ENDPOINT_URL` | unset | S3-compatible endpoint URL, such as Cloudflare R2. |
 | `STABLE_AUDIO_STORAGE_REGION` | `us-east-1` | S3 region. Use `auto` for Cloudflare R2 if desired. |
